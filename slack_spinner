@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PID_FILE="$SCRIPT_DIR/.slack_spinner.pid"
+LOG_FILE="$SCRIPT_DIR/.slack_spinner.log"
+PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
+SPINNER_SCRIPT="$SCRIPT_DIR/slack_status_spinner.py"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  PYTHON_BIN="$(command -v python3)"
+fi
+
+usage() {
+  cat <<'EOF'
+Usage: ./slack_spinner {start|stop|restart|status}
+
+Commands:
+  start    Start the Slack status spinner in the background
+  stop     Stop the running spinner and restore the previous Slack status
+  restart  Restart the spinner
+  status   Show whether the spinner is currently running
+EOF
+}
+
+is_running() {
+  if [[ ! -f "$PID_FILE" ]]; then
+    return 1
+  fi
+
+  local pid
+  pid="$(cat "$PID_FILE")"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+start_spinner() {
+  if is_running; then
+    echo "Slack spinner is already running with PID $(cat "$PID_FILE")."
+    return 0
+  fi
+
+  if [[ -f "$PID_FILE" ]]; then
+    rm -f "$PID_FILE"
+  fi
+
+  local pid
+  pushd "$SCRIPT_DIR" >/dev/null
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$PYTHON_BIN" -u "$SPINNER_SCRIPT" </dev/null >>"$LOG_FILE" 2>&1 &
+  else
+    nohup "$PYTHON_BIN" -u "$SPINNER_SCRIPT" </dev/null >>"$LOG_FILE" 2>&1 &
+  fi
+  pid=$!
+  disown "$pid" 2>/dev/null || true
+  popd >/dev/null
+  echo "$pid" >"$PID_FILE"
+
+  sleep 1
+
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "Slack spinner started with PID $pid."
+    echo "Logs: $LOG_FILE"
+  else
+    echo "Slack spinner failed to start. Check $LOG_FILE for details." >&2
+    rm -f "$PID_FILE"
+    return 1
+  fi
+}
+
+stop_spinner() {
+  if ! is_running; then
+    echo "Slack spinner is not running."
+    rm -f "$PID_FILE"
+    return 0
+  fi
+
+  local pid
+  pid="$(cat "$PID_FILE")"
+  kill -TERM "$pid"
+
+  for _ in {1..15}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$PID_FILE"
+      echo "Slack spinner stopped."
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Slack spinner did not stop within 15 seconds." >&2
+  return 1
+}
+
+status_spinner() {
+  if is_running; then
+    echo "Slack spinner is running with PID $(cat "$PID_FILE")."
+    echo "Logs: $LOG_FILE"
+  else
+    echo "Slack spinner is not running."
+    rm -f "$PID_FILE"
+  fi
+}
+
+main() {
+  case "${1:-}" in
+    start)
+      start_spinner
+      ;;
+    stop)
+      stop_spinner
+      ;;
+    restart)
+      stop_spinner || true
+      start_spinner
+      ;;
+    status)
+      status_spinner
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

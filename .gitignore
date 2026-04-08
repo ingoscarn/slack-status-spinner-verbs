@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.slack_spinner.pid
+.slack_spinner.log
