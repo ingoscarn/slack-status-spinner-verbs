@@ -26,6 +26,8 @@ VERBS_PATH = REPO_ROOT / "spinner_verbs.txt"
 EXPECTED_ENV_KEYS = [
     "SLACK_USER_TOKEN",
     "STATUS_EMOJI",
+    "ENABLE_DYNAMIC_EMOJIS",
+    "EMOJIS_FILE",
     "STATUS_PREFIX",
     "STATUS_SUFFIX",
     "UPDATE_INTERVAL_SECONDS",
@@ -70,6 +72,8 @@ class SlackStatusSpinnerRuntimeTests(unittest.TestCase):
             slack_user_token="xoxp-test-token",
             verbs_file=verbs_file,
             status_emoji=":thought_balloon:",
+            dynamic_emojis_enabled=False,
+            emojis_file=None,
             status_prefix="",
             status_suffix="...",
             interval_seconds=10,
@@ -136,6 +140,40 @@ class SlackStatusSpinnerRuntimeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 spinner._load_verbs()
 
+    def test_load_emojis_ignores_blank_lines_and_comments(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            verbs_file = Path(tmp_dir) / "verbs.txt"
+            verbs_file.write_text("Thinking\n", encoding="utf-8")
+            emojis_file = Path(tmp_dir) / "emojis.txt"
+            emojis_file.write_text(":robot_face:\n\n# disabled\n🐝\n", encoding="utf-8")
+
+            config = self.make_config(verbs_file)
+            config.dynamic_emojis_enabled = True
+            config.emojis_file = emojis_file
+            spinner = SlackStatusSpinner(config)
+
+            self.assertEqual(spinner._load_emojis(), [":robot_face:", "🐝"])
+
+    def test_run_uses_dynamic_emojis_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            verbs_file = Path(tmp_dir) / "verbs.txt"
+            verbs_file.write_text("Thinking\nAnalyzing\n", encoding="utf-8")
+            emojis_file = Path(tmp_dir) / "emojis.txt"
+            emojis_file.write_text(":robot_face:\n:pepebrain:\n", encoding="utf-8")
+
+            config = self.make_config(verbs_file)
+            config.dynamic_emojis_enabled = True
+            config.emojis_file = emojis_file
+            spinner = SlackStatusSpinner(config)
+            fake_client = FakeWebClient()
+            spinner.client = fake_client
+            spinner._sleep_with_shutdown = lambda _seconds: False
+
+            exit_code = spinner.run()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(fake_client.set_calls[0]["status_emoji"], ":robot_face:")
+
 
 class ProjectConfigurationTests(unittest.TestCase):
     def test_env_example_contains_expected_keys(self):
@@ -151,12 +189,14 @@ class ProjectConfigurationTests(unittest.TestCase):
         env = {
             "SLACK_USER_TOKEN": "xoxp-test-token",
             "STATUS_EMOJI": DEFAULT_STATUS_EMOJI,
+            "ENABLE_DYNAMIC_EMOJIS": "false",
+            "EMOJIS_FILE": "emojis.txt",
             "STATUS_PREFIX": "",
             "STATUS_SUFFIX": DEFAULT_STATUS_SUFFIX,
             "VERB_ORDER": "rotate",
             "VERBS_FILE": "spinner_verbs.txt",
         }
-        with patch.dict(os.environ, env, clear=True):
+        with patch("slack_status_spinner.load_dotenv", return_value=True), patch.dict(os.environ, env, clear=True):
             config = load_config()
 
         self.assertEqual(config.interval_seconds, DEFAULT_INTERVAL_SECONDS)
@@ -166,8 +206,32 @@ class ProjectConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(config.expiration_seconds, expected_expiration)
         self.assertEqual(config.status_emoji, DEFAULT_STATUS_EMOJI)
+        self.assertFalse(config.dynamic_emojis_enabled)
         self.assertEqual(config.status_suffix, DEFAULT_STATUS_SUFFIX)
         self.assertEqual(config.verb_order, "rotate")
+
+    def test_load_config_requires_emojis_file_when_dynamic_emojis_enabled(self):
+        env = {
+            "SLACK_USER_TOKEN": "xoxp-test-token",
+            "ENABLE_DYNAMIC_EMOJIS": "true",
+            "EMOJIS_FILE": "",
+            "STATUS_EMOJI": DEFAULT_STATUS_EMOJI,
+            "STATUS_SUFFIX": DEFAULT_STATUS_SUFFIX,
+            "VERB_ORDER": "rotate",
+            "VERBS_FILE": "spinner_verbs.txt",
+        }
+        with patch("slack_status_spinner.load_dotenv", return_value=True), patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(RuntimeError):
+                load_config()
+
+    def test_emojis_file_contains_entries(self):
+        emojis_path = REPO_ROOT / "emojis.txt"
+        emojis = [
+            line.strip()
+            for line in emojis_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertGreater(len(emojis), 0)
 
     def test_wrapper_script_has_valid_shell_syntax(self):
         subprocess.run(["bash", "-n", str(WRAPPER_PATH)], check=True, cwd=REPO_ROOT)

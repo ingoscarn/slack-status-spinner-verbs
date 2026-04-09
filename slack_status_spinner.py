@@ -28,6 +28,8 @@ class Config:
     slack_user_token: str
     verbs_file: Path
     status_emoji: str
+    dynamic_emojis_enabled: bool
+    emojis_file: Path | None
     status_prefix: str
     status_suffix: str
     interval_seconds: int
@@ -51,13 +53,17 @@ class SlackStatusSpinner:
 
     def run(self) -> int:
         verbs = self._load_verbs()
+        emojis = self._load_emojis() if self.config.dynamic_emojis_enabled else None
         self.original_status = self._fetch_current_status()
         self._install_signal_handlers()
+        emoji_sequence = self._emoji_sequence(emojis) if emojis else None
         self._log(
             "Starting status spinner",
             interval=self.config.interval_seconds,
             expiration=self.config.expiration_seconds,
             verb_count=len(verbs),
+            emoji_count=len(emojis) if emojis else 1,
+            dynamic_emojis=self.config.dynamic_emojis_enabled,
             order=self.config.verb_order,
         )
 
@@ -66,7 +72,8 @@ class SlackStatusSpinner:
                 if self.shutdown_requested:
                     break
                 status_text = self._compose_status_text(verb)
-                updated = self._attempt_status_update(status_text)
+                status_emoji = next(emoji_sequence) if emoji_sequence else self.config.status_emoji
+                updated = self._attempt_status_update(status_text, status_emoji)
                 if not updated:
                     break
                 if not self._sleep_with_shutdown(self.config.interval_seconds):
@@ -77,22 +84,31 @@ class SlackStatusSpinner:
         return 0
 
     def _load_verbs(self) -> list[str]:
-        if not self.config.verbs_file.exists():
-            raise RuntimeError(f"Verb file not found: {self.config.verbs_file}")
+        return self._load_entries(self.config.verbs_file, "Verb")
 
-        verbs = [
+    def _load_emojis(self) -> list[str]:
+        if self.config.emojis_file is None:
+            raise RuntimeError("Dynamic emojis are enabled but EMOJIS_FILE is not configured.")
+        return self._load_entries(self.config.emojis_file, "Emoji")
+
+    @staticmethod
+    def _load_entries(file_path: Path, label: str) -> list[str]:
+        if not file_path.exists():
+            raise RuntimeError(f"{label} file not found: {file_path}")
+
+        entries = [
             line.strip()
-            for line in self.config.verbs_file.read_text(encoding="utf-8").splitlines()
+            for line in file_path.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.strip().startswith("#")
         ]
 
-        if not verbs:
+        if not entries:
             raise RuntimeError(
-                f"Verb file is empty or invalid: {self.config.verbs_file}. "
-                "Add at least one non-empty line."
+                f"{label} file is empty or invalid: {file_path}. "
+                f"Add at least one non-empty line."
             )
 
-        return verbs
+        return entries
 
     def _fetch_current_status(self) -> SavedStatus:
         try:
@@ -126,15 +142,21 @@ class SlackStatusSpinner:
         signal.signal(signal.SIGTERM, _handle_signal)
 
     def _verb_sequence(self, verbs: list[str]) -> Iterable[str]:
-        ordered_verbs = list(verbs)
+        yield from self._cyclic_sequence(verbs)
+
+    def _emoji_sequence(self, emojis: list[str]) -> Iterable[str]:
+        yield from self._cyclic_sequence(emojis)
+
+    def _cyclic_sequence(self, entries: list[str]) -> Iterable[str]:
+        ordered_entries = list(entries)
         if self.config.verb_order == "random":
-            random.shuffle(ordered_verbs)
+            random.shuffle(ordered_entries)
 
         while True:
-            for verb in ordered_verbs:
-                yield verb
+            for entry in ordered_entries:
+                yield entry
             if self.config.verb_order == "random":
-                random.shuffle(ordered_verbs)
+                random.shuffle(ordered_entries)
 
     def _compose_status_text(self, verb: str) -> str:
         text = f"{self.config.status_prefix}{verb}{self.config.status_suffix}".strip()
@@ -144,7 +166,7 @@ class SlackStatusSpinner:
             )
         return text
 
-    def _attempt_status_update(self, status_text: str) -> bool:
+    def _attempt_status_update(self, status_text: str, status_emoji: str) -> bool:
         backoff_seconds = 5
         while not self.shutdown_requested:
             try:
@@ -152,14 +174,14 @@ class SlackStatusSpinner:
                 self.client.users_profile_set(
                     profile={
                         "status_text": status_text,
-                        "status_emoji": self.config.status_emoji,
+                        "status_emoji": status_emoji,
                         "status_expiration": expiration,
                     }
                 )
                 self._log(
                     "Updated Slack status",
                     status_text=status_text,
-                    status_emoji=self.config.status_emoji,
+                    status_emoji=status_emoji,
                     expires_at=expiration,
                 )
                 return True
@@ -266,6 +288,9 @@ def load_config() -> Config:
 
     verbs_file = Path(os.getenv("VERBS_FILE", "spinner_verbs.txt")).expanduser().resolve()
     status_emoji = os.getenv("STATUS_EMOJI", DEFAULT_STATUS_EMOJI).strip() or DEFAULT_STATUS_EMOJI
+    dynamic_emojis_enabled = parse_bool("ENABLE_DYNAMIC_EMOJIS", False)
+    emojis_file_raw = os.getenv("EMOJIS_FILE", "").strip()
+    emojis_file = Path(emojis_file_raw).expanduser().resolve() if emojis_file_raw else None
     status_prefix = os.getenv("STATUS_PREFIX", "").strip()
     status_suffix = os.getenv("STATUS_SUFFIX", DEFAULT_STATUS_SUFFIX).strip() or DEFAULT_STATUS_SUFFIX
     interval_seconds = parse_positive_int("UPDATE_INTERVAL_SECONDS", DEFAULT_INTERVAL_SECONDS)
@@ -280,11 +305,15 @@ def load_config() -> Config:
     verb_order = os.getenv("VERB_ORDER", "rotate").strip().lower() or "rotate"
     if verb_order not in {"rotate", "random"}:
         raise RuntimeError("VERB_ORDER must be either 'rotate' or 'random'.")
+    if dynamic_emojis_enabled and emojis_file is None:
+        raise RuntimeError("EMOJIS_FILE is required when ENABLE_DYNAMIC_EMOJIS is true.")
 
     return Config(
         slack_user_token=slack_user_token,
         verbs_file=verbs_file,
         status_emoji=status_emoji,
+        dynamic_emojis_enabled=dynamic_emojis_enabled,
+        emojis_file=emojis_file,
         status_prefix=f"{status_prefix} " if status_prefix else "",
         status_suffix=status_suffix,
         interval_seconds=interval_seconds,
@@ -304,6 +333,15 @@ def parse_positive_int(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be greater than zero.")
 
     return value
+
+
+def parse_bool(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name, "true" if default else "false").strip().lower()
+    if raw_value in {"1", "true", "yes", "on"}:
+        return True
+    if raw_value in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean value like true/false. Received: {raw_value!r}")
 
 
 def main() -> int:
