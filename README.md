@@ -13,7 +13,9 @@ Este proyecto crea ese efecto de forma local: rota tu estado personalizado de Sl
 - Actualiza únicamente tu propio estado de Slack
 - Usa un token de usuario de Slack, no un bot
 - Cambia el texto del estado en formato `Verbo...`
+- Puede usar un emoji fijo o una lista de emojis dinámicos
 - Lee los verbos desde un archivo de texto plano
+- Puede leer emojis estándar Unicode o emojis custom de Slack desde `emojis.txt`
 - Restaura tu estado anterior al detenerse correctamente
 - Define expiración corta para evitar que el estado se quede pegado si el proceso muere
 - Registra cada actualización en consola o en log
@@ -40,6 +42,7 @@ El orden por defecto es `rotate` porque reparte los verbos de forma pareja, es p
 ├── .env.example
 ├── .gitignore
 ├── README.md
+├── emojis.txt
 ├── requirements.txt
 ├── slack_spinner
 ├── slack_status_spinner.py
@@ -179,6 +182,7 @@ Qué validan esos tests:
 - que `.env` y `.env.example` tengan las mismas variables
 - que `.env.example` siga alineado con la configuración soportada por el script
 - que `spinner_verbs.txt` tenga verbos válidos
+- que `emojis.txt` tenga emojis válidos para el modo dinámico
 - que el wrapper `slack_spinner` no tenga errores de sintaxis shell
 
 ## Configuración
@@ -186,7 +190,9 @@ Qué validan esos tests:
 Toda la configuración es local y por variables de entorno:
 
 - `SLACK_USER_TOKEN`: token de usuario de Slack con `users.profile:read` y `users.profile:write`
-- `STATUS_EMOJI`: emoji del estado, por ejemplo `:thought_balloon:`
+- `STATUS_EMOJI`: emoji fijo del estado cuando no usas modo dinámico, por ejemplo `:thought_balloon:`
+- `ENABLE_DYNAMIC_EMOJIS`: `true` o `false`
+- `EMOJIS_FILE`: archivo de emojis que se usa cuando `ENABLE_DYNAMIC_EMOJIS=true`
 - `STATUS_PREFIX`: texto opcional antes del verbo
 - `STATUS_SUFFIX`: texto opcional después del verbo. Default: `...`
 - `UPDATE_INTERVAL_SECONDS`: cada cuánto cambia el estado. Default: `10`
@@ -198,6 +204,8 @@ Ejemplos:
 
 - con la configuración por defecto: `Thinking...`
 - si `STATUS_PREFIX=Still`: `Still Thinking...`
+- si `ENABLE_DYNAMIC_EMOJIS=true`: en cada update usa el siguiente emoji de `emojis.txt`
+- si `ENABLE_DYNAMIC_EMOJIS=false`: usa siempre el valor de `STATUS_EMOJI`
 
 ## Archivo de verbos
 
@@ -208,6 +216,21 @@ Reglas:
 - las líneas vacías se ignoran
 - las líneas que empiezan con `#` se ignoran
 - puedes comentar verbos temporalmente para probar distintas listas
+
+## Archivo de emojis
+
+`emojis.txt` es un archivo de texto plano con un emoji por línea.
+
+Soporta:
+
+- emojis estándar Unicode, por ejemplo `🐝`
+- emojis custom de Slack, por ejemplo `:custom_emoji:`
+
+Reglas:
+
+- las líneas vacías se ignoran
+- las líneas que empiezan con `#` se ignoran
+- si el modo dinámico está activado, el script rota por esa lista usando el mismo criterio de orden configurado en `VERB_ORDER`
 
 ## Comportamiento al apagar
 
