@@ -21,6 +21,7 @@ DEFAULT_INTERVAL_SECONDS = 10
 DEFAULT_EXPIRATION_PADDING_SECONDS = 30
 DEFAULT_STATUS_EMOJI = ":thought_balloon:"
 DEFAULT_STATUS_SUFFIX = "..."
+MAX_CONSECUTIVE_EMOJI_ERRORS = 3
 
 
 @dataclass
@@ -50,20 +51,23 @@ class SlackStatusSpinner:
         self.client = WebClient(token=config.slack_user_token)
         self.shutdown_requested = False
         self.original_status: SavedStatus | None = None
+        self.dynamic_emojis_active = config.dynamic_emojis_enabled
+        self.available_dynamic_emojis: list[str] = []
+        self.consecutive_emoji_errors = 0
+        self.static_emoji_active = bool(config.status_emoji)
 
     def run(self) -> int:
         verbs = self._load_verbs()
-        emojis = self._load_emojis() if self.config.dynamic_emojis_enabled else None
+        self.available_dynamic_emojis = self._load_emojis() if self.dynamic_emojis_active else []
         self.original_status = self._fetch_current_status()
         self._install_signal_handlers()
-        emoji_sequence = self._emoji_sequence(emojis) if emojis else None
         self._log(
             "Starting status spinner",
             interval=self.config.interval_seconds,
             expiration=self.config.expiration_seconds,
             verb_count=len(verbs),
-            emoji_count=len(emojis) if emojis else 1,
-            dynamic_emojis=self.config.dynamic_emojis_enabled,
+            emoji_count=len(self.available_dynamic_emojis) if self.available_dynamic_emojis else 1,
+            dynamic_emojis=self.dynamic_emojis_active,
             order=self.config.verb_order,
         )
 
@@ -72,8 +76,7 @@ class SlackStatusSpinner:
                 if self.shutdown_requested:
                     break
                 status_text = self._compose_status_text(verb)
-                status_emoji = next(emoji_sequence) if emoji_sequence else self.config.status_emoji
-                updated = self._attempt_status_update(status_text, status_emoji)
+                updated = self._attempt_status_update(status_text)
                 if not updated:
                     break
                 if not self._sleep_with_shutdown(self.config.interval_seconds):
@@ -144,9 +147,6 @@ class SlackStatusSpinner:
     def _verb_sequence(self, verbs: list[str]) -> Iterable[str]:
         yield from self._cyclic_sequence(verbs)
 
-    def _emoji_sequence(self, emojis: list[str]) -> Iterable[str]:
-        yield from self._cyclic_sequence(emojis)
-
     def _cyclic_sequence(self, entries: list[str]) -> Iterable[str]:
         ordered_entries = list(entries)
         if self.config.verb_order == "random":
@@ -166,9 +166,10 @@ class SlackStatusSpinner:
             )
         return text
 
-    def _attempt_status_update(self, status_text: str, status_emoji: str) -> bool:
+    def _attempt_status_update(self, status_text: str) -> bool:
         backoff_seconds = 5
         while not self.shutdown_requested:
+            status_emoji, emoji_source = self._select_status_emoji()
             try:
                 expiration = int(time.time()) + self.config.expiration_seconds
                 self.client.users_profile_set(
@@ -182,14 +183,21 @@ class SlackStatusSpinner:
                     "Updated Slack status",
                     status_text=status_text,
                     status_emoji=status_emoji,
+                    emoji_source=emoji_source,
                     expires_at=expiration,
                 )
+                self.consecutive_emoji_errors = 0
                 return True
             except SlackApiError as exc:
                 response = exc.response
                 error_code = response.get("error", "unknown_error")
                 headers = response.headers if response is not None else {}
                 retry_after = headers.get("Retry-After") if headers else None
+
+                if error_code == "profile_status_set_failed_not_valid_emoji":
+                    if self._handle_invalid_emoji(status_emoji, emoji_source):
+                        continue
+                    raise RuntimeError(self._describe_slack_error("Slack rejected the status update", exc)) from exc
 
                 if response.status_code == 429 or error_code == "ratelimited":
                     delay = int(retry_after or 30)
@@ -222,6 +230,61 @@ class SlackStatusSpinner:
                 if not self._sleep_with_shutdown(backoff_seconds):
                     return False
                 backoff_seconds = min(backoff_seconds * 2, 60)
+
+        return False
+
+    def _select_status_emoji(self) -> tuple[str, str]:
+        if self.dynamic_emojis_active and self.available_dynamic_emojis:
+            if self.config.verb_order == "random":
+                return random.choice(self.available_dynamic_emojis), "dynamic"
+
+            emoji = self.available_dynamic_emojis.pop(0)
+            self.available_dynamic_emojis.append(emoji)
+            return emoji, "dynamic"
+
+        if self.static_emoji_active:
+            return self.config.status_emoji, "static"
+
+        return "", "none"
+
+    def _handle_invalid_emoji(self, invalid_emoji: str, emoji_source: str) -> bool:
+        self.consecutive_emoji_errors += 1
+        self._log(
+            "Slack rejected an invalid emoji; applying fallback",
+            invalid_emoji=invalid_emoji,
+            emoji_source=emoji_source,
+            consecutive_emoji_errors=self.consecutive_emoji_errors,
+        )
+
+        if emoji_source == "dynamic":
+            self.available_dynamic_emojis = [
+                emoji for emoji in self.available_dynamic_emojis if emoji != invalid_emoji
+            ]
+            self._log(
+                "Removed invalid dynamic emoji from rotation",
+                invalid_emoji=invalid_emoji,
+                remaining_dynamic_emojis=len(self.available_dynamic_emojis),
+            )
+
+            if (
+                self.consecutive_emoji_errors > MAX_CONSECUTIVE_EMOJI_ERRORS
+                or not self.available_dynamic_emojis
+            ):
+                self.dynamic_emojis_active = False
+                self._log(
+                    "Disabled dynamic emoji mode after repeated emoji failures",
+                    fallback="static" if self.static_emoji_active else "none",
+                )
+
+            return True
+
+        if emoji_source == "static":
+            self.static_emoji_active = False
+            self._log(
+                "Static emoji is invalid; continuing without emoji",
+                invalid_emoji=invalid_emoji,
+            )
+            return True
 
         return False
 
