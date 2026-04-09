@@ -5,11 +5,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from slack_sdk.errors import SlackApiError
+
 from slack_status_spinner import (
     DEFAULT_EXPIRATION_PADDING_SECONDS,
     DEFAULT_INTERVAL_SECONDS,
     DEFAULT_STATUS_EMOJI,
     DEFAULT_STATUS_SUFFIX,
+    MAX_CONSECUTIVE_EMOJI_ERRORS,
     Config,
     SavedStatus,
     SlackStatusSpinner,
@@ -48,9 +51,11 @@ def parse_env_keys(path: Path) -> list[str]:
 
 
 class FakeWebClient:
-    def __init__(self):
+    def __init__(self, invalid_emojis: set[str] | None = None):
         self.get_calls = 0
         self.set_calls = []
+        self.attempted_profiles = []
+        self.invalid_emojis = invalid_emojis or set()
         self.profile = {
             "status_text": "Existing status",
             "status_emoji": ":wave:",
@@ -62,8 +67,24 @@ class FakeWebClient:
         return {"profile": self.profile}
 
     def users_profile_set(self, profile):
+        self.attempted_profiles.append(profile)
+        if profile["status_emoji"] in self.invalid_emojis:
+            raise SlackApiError(
+                message="invalid emoji",
+                response=FakeSlackResponse("profile_status_set_failed_not_valid_emoji"),
+            )
         self.set_calls.append(profile)
         return {"ok": True}
+
+
+class FakeSlackResponse:
+    def __init__(self, error: str, status_code: int = 200, headers: dict[str, str] | None = None):
+        self.data = {"error": error}
+        self.status_code = status_code
+        self.headers = headers or {}
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
 
 
 class SlackStatusSpinnerRuntimeTests(unittest.TestCase):
@@ -173,6 +194,95 @@ class SlackStatusSpinnerRuntimeTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(fake_client.set_calls[0]["status_emoji"], ":robot_face:")
+
+    def test_invalid_dynamic_emoji_is_removed_and_next_emoji_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            verbs_file = Path(tmp_dir) / "verbs.txt"
+            verbs_file.write_text("Thinking\n", encoding="utf-8")
+            emojis_file = Path(tmp_dir) / "emojis.txt"
+            emojis_file.write_text(":bad:\n:good:\n", encoding="utf-8")
+
+            config = self.make_config(verbs_file)
+            config.dynamic_emojis_enabled = True
+            config.emojis_file = emojis_file
+            spinner = SlackStatusSpinner(config)
+            fake_client = FakeWebClient(invalid_emojis={":bad:"})
+            spinner.client = fake_client
+            spinner._sleep_with_shutdown = lambda _seconds: False
+
+            exit_code = spinner.run()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(fake_client.attempted_profiles[0]["status_emoji"], ":bad:")
+            self.assertEqual(fake_client.set_calls[0]["status_emoji"], ":good:")
+            self.assertEqual(spinner.available_dynamic_emojis, [":good:"])
+
+    def test_repeated_invalid_dynamic_emojis_disable_dynamic_mode_and_fallback_to_static(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            verbs_file = Path(tmp_dir) / "verbs.txt"
+            verbs_file.write_text("Thinking\n", encoding="utf-8")
+            emojis_file = Path(tmp_dir) / "emojis.txt"
+            emojis_file.write_text(":bad1:\n:bad2:\n:bad3:\n:bad4:\n", encoding="utf-8")
+
+            config = self.make_config(verbs_file)
+            config.dynamic_emojis_enabled = True
+            config.emojis_file = emojis_file
+            config.status_emoji = ":static:"
+            spinner = SlackStatusSpinner(config)
+            fake_client = FakeWebClient(invalid_emojis={":bad1:", ":bad2:", ":bad3:", ":bad4:"})
+            spinner.client = fake_client
+            spinner._sleep_with_shutdown = lambda _seconds: False
+
+            exit_code = spinner.run()
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(spinner.dynamic_emojis_active)
+            self.assertEqual(spinner.consecutive_emoji_errors, 0)
+            self.assertEqual(fake_client.set_calls[0]["status_emoji"], ":static:")
+
+    def test_invalid_static_emoji_after_dynamic_fallback_continues_without_emoji(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            verbs_file = Path(tmp_dir) / "verbs.txt"
+            verbs_file.write_text("Thinking\n", encoding="utf-8")
+            emojis_file = Path(tmp_dir) / "emojis.txt"
+            emojis_file.write_text(":bad1:\n:bad2:\n:bad3:\n:bad4:\n", encoding="utf-8")
+
+            config = self.make_config(verbs_file)
+            config.dynamic_emojis_enabled = True
+            config.emojis_file = emojis_file
+            config.status_emoji = ":badstatic:"
+            spinner = SlackStatusSpinner(config)
+            fake_client = FakeWebClient(
+                invalid_emojis={":bad1:", ":bad2:", ":bad3:", ":bad4:", ":badstatic:"}
+            )
+            spinner.client = fake_client
+            spinner._sleep_with_shutdown = lambda _seconds: False
+
+            exit_code = spinner.run()
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(spinner.dynamic_emojis_active)
+            self.assertFalse(spinner.static_emoji_active)
+            self.assertEqual(fake_client.set_calls[0]["status_emoji"], "")
+
+    def test_invalid_static_emoji_falls_back_to_no_emoji(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            verbs_file = Path(tmp_dir) / "verbs.txt"
+            verbs_file.write_text("Thinking\n", encoding="utf-8")
+
+            config = self.make_config(verbs_file)
+            config.status_emoji = ":badstatic:"
+            spinner = SlackStatusSpinner(config)
+            fake_client = FakeWebClient(invalid_emojis={":badstatic:"})
+            spinner.client = fake_client
+            spinner._sleep_with_shutdown = lambda _seconds: False
+
+            exit_code = spinner.run()
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(spinner.static_emoji_active)
+            self.assertEqual(fake_client.attempted_profiles[0]["status_emoji"], ":badstatic:")
+            self.assertEqual(fake_client.set_calls[0]["status_emoji"], "")
 
 
 class ProjectConfigurationTests(unittest.TestCase):

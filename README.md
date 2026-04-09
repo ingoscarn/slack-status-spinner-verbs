@@ -247,6 +247,9 @@ El script contempla los casos más importantes para uso local:
 - token inválido, expirado o revocado: termina con error claro
 - falla de red o error transitorio del cliente: reintenta con backoff
 - archivo de verbos vacío o inválido: termina antes de cambiar nada
+- emoji dinámico inválido: lo omite, lo saca de la rotación y prueba el siguiente
+- más de 3 errores consecutivos de emoji: desactiva emojis dinámicos y vuelve al emoji estático
+- si el emoji estático también falla: continúa sin emoji
 - falla al restaurar el estado: lo registra en logs y confía en la expiración corta como respaldo
 
 ## Notas de la API de Slack
